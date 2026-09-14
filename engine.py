@@ -282,20 +282,35 @@ def build_ffmpeg_cmd(src, dst, cfg, layout, anaglyph=False, force_cpu_decode=Fal
         # Anaglyph is heavy (two eyes + per-pixel blend). Use a configurable (often
         # lower) height and cheap bilinear scaling so slower machines (Intel iGPU) can
         # keep up in realtime. Through colored glasses the quality drop is invisible.
-        H = int(getattr(cfg, "anaglyph_height", 0) or cfg.target_height or 1080)
-        W = int(H * 16 / 9)
-        # Split into left & right eyes (full-frame each), then combine with the exact
-        # ghost-reduction math from the original green/magenta shader. This cancels
-        # crosstalk far better than ffmpeg's built-in anaglyph.
+        # Cap the output HEIGHT for performance (anaglyph_height), but PRESERVE the
+        # real aspect ratio -- do NOT force 16:9, or cinemascope (2.40:1) 3D movies
+        # get stretched tall. We un-squish the cropped eye (like the 2D path), then
+        # scale by height with width auto (-2) to keep the true shape.
+        capH = int(getattr(cfg, "anaglyph_height", 0) or cfg.target_height or 1080)
+        # Work out the TRUE display aspect of one eye's final (un-squished) image, so
+        # the output isn't stretched, then scale each eye straight to that small size
+        # BEFORE the expensive per-pixel blend (~6x faster on weak CPUs).
+        #   SBS full:  one eye = (w/2) x h                 -> ar = (w/2)/h
+        #   SBS half:  one eye is squished; full image = w x h (2*eye_w) -> ar = w/h
+        #   OU  full:  one eye = w x (h/2)                 -> ar = w/(h/2)
+        #   OU  half:  one eye squished; full image = w x h -> ar = w/h
+        if w and h:
+            if axis == "ou":
+                disp_ar = (w / (h / 2)) if full else (w / h)
+            else:
+                disp_ar = ((w / 2) / h) if full else (w / h)
+        else:
+            disp_ar = 16 / 9
+        targW = max(2, int(round(capH * disp_ar / 2)) * 2)
         if axis == "ou":
             lcrop = "crop=iw:ih/2:0:0"
             rcrop = "crop=iw:ih/2:0:ih/2"
         else:
             lcrop = "crop=iw/2:ih:0:0"
             rcrop = "crop=iw/2:ih:iw/2:0"
-        # IMPORTANT: force planar RGB (gbrp) before blend, or blend operates in YUV and
-        # the channel math produces a heavy green cast. gbrp planes are G,B,R.
-        sc = f"scale={W}:{H}:flags=bilinear,format=gbrp,setsar=1"
+        # scale each cropped eye straight to the small target -> blend runs cheap.
+        # gbrp = planar RGB so the blend math is in RGB (else heavy green cast).
+        sc = f"scale={targW}:{capH}:flags=bilinear,format=gbrp,setsar=1"
         # Green/magenta with ghost reduction (TOP=left eye, BOTTOM=right eye):
         #   c0 Green = right.g - left.g*L
         #   c1 Blue  = left.b  - right.b*L
