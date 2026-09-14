@@ -1,0 +1,116 @@
+# ============================================================
+#  SBS2Flat  -  configuration
+#  Turn your 3D (side-by-side / over-under) movie library into
+#  normal 2D (or green/magenta anaglyph) for Plex, Jellyfin or Emby.
+#
+#  Copy this file to  config.yaml  and edit the values below.
+#  Lines starting with #  are comments (ignored).
+# ============================================================
+
+# Where the 2D/3D/anaglyph view should appear.
+# A FOLDER PATH is the most reliable (e.g. "C:\\SBS2Flat").
+# A drive letter (like "Z:") also works, but if it won't create, use a folder.
+# Point your media server (Plex/Jellyfin/Emby) at this location -- or just open
+# it in a file browser / VLC and play straight from it.
+output: "C:\\SBS2Flat"
+
+# ------------------------------------------------------------
+#  Your source folders.  Each entry becomes a folder in the output.
+#    label -> the folder name your media server will see
+#    path  -> where your real 3D files live (local disk, NAS, or an already-
+#             mounted cloud/rclone drive -- anything Windows can read)
+#    mode  -> 2d       : crop to flat 2D               (most common)
+#             anaglyph : green/magenta 3D, any screen + cheap glasses
+#             3d       : pass through unchanged (raw side-by-side / over-under)
+#
+#  List the SAME path under different labels/modes to offer a movie more than
+#  one way (e.g. a 2D copy AND an anaglyph copy).
+# ------------------------------------------------------------
+libraries:
+  # --- Movies ---
+  - label: "Movies"
+    path: "Y:\\Blockbuster Movies"
+    mode: 2d
+
+  # --- TV Shows ---  (works the same as movies)
+  # - label: "TV Shows"
+  #   path: "D:\\3D TV Shows"
+  #   mode: 2d
+
+  # --- Examples (uncomment to use) ---
+  # Same movies, also offered as anaglyph:
+  - label: "Movies (Anaglyph)"
+    path: "Y:\\Blockbuster Movies"
+    mode: anaglyph
+
+  # Same shows, also offered as raw 3D for a 3D TV:
+  # - label: "TV Shows 3D"
+  #   path: "D:\\3D TV Shows"
+  #   mode: 3d
+
+# ------------------------------------------------------------
+#  Encoding  (usually leave these alone)
+# ------------------------------------------------------------
+# Hardware encoder. Options: auto, qsv (Intel), nvenc (NVIDIA), software
+#   - NVIDIA GPU  -> use  nvenc
+#   - Intel CPU/iGPU with QuickSync -> use  qsv
+#   - No hardware / unsure -> use  software  (works everywhere, uses more CPU)
+# NOTE: if the wrong one is chosen, ffmpeg won't start and nothing will play.
+encoder: nvenc
+
+# Full path to ffmpeg.exe. "auto" finds it on your PATH.
+# If nothing plays, set the full path explicitly, e.g.:
+#   ffmpeg: "C:\\ffmpeg\\bin\\ffmpeg.exe"
+ffmpeg: auto
+
+# Output height for the flattened video (1080 = 1080p).
+target_height: 1080
+
+# Video quality (lower = better/larger; 21 is a good default).
+quality: 21
+
+# Anaglyph ghost-reduction strength (only affects "anaglyph" mode).
+# This cancels crosstalk (the ghosting where you see the other eye bleed through)
+# by subtracting each eye from the other. Range 0.0-0.6:
+#   0.0 = no cancellation (brightest, most ghosting)
+#   0.30 = default (good balance)
+#   0.50 = strong cancellation (least ghosting, slightly darker)
+anaglyph_ghost: 0.30
+
+# Anaglyph output height. Anaglyph is CPU-heavy; on slower machines (e.g. Intel
+# iGPU) it can stutter at 1080p. Lowering it makes anaglyph encode much faster and
+# it looks the same through colored glasses.
+#   0   = same as target_height (best for strong GPUs like NVIDIA)
+#   720 = recommended for Intel / weaker machines
+#   540 = for very weak machines
+# Only affects anaglyph mode; 2D and 3D stay at full resolution.
+anaglyph_height: 0
+
+# Max number of titles converting at once. Raise on a strong PC; lower if it struggles.
+max_transcodes: 2
+
+# GPU decoding (NVIDIA only). When encoder is nvenc, also decode the source on the
+# GPU so your CPU isn't doing the heavy 4K/HEVC/AV1 decoding. Big CPU savings.
+# Files whose codec the GPU can't decode automatically fall back to CPU decode.
+# Set false to always decode on CPU.
+gpu_decode: true
+
+# ------------------------------------------------------------
+#  Tidying  (usually leave these alone)
+# ------------------------------------------------------------
+# Strip 3D tags (_HSBS, _3D, etc.) and release junk from names so cover art matches.
+clean_names: true
+
+# Hide disc images (.iso) and VR clips -- they can't be flattened and jam scans.
+hide_junk: true
+
+# Collapse redundant "movie-folder-inside-a-movie-folder" nesting.
+collapse_folders: true
+
+# ------------------------------------------------------------
+#  Startup timing
+# ------------------------------------------------------------
+# If your source folders live on an rclone / NAS mount that comes up at login,
+# SBS2Flat may start BEFORE those mounts are ready. This makes it wait (up to this
+# many seconds) for the folders to appear before mounting. Set 0 to disable waiting.
+wait_for_sources: 120
