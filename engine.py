@@ -217,13 +217,25 @@ def detect_layout(src, name):
     return axis, (0 if la >= lb else 1)
 
 
+_WH_CACHE = {}
+
 def _probe_wh(src):
-    """Return (width, height) of the source video, or (0,0) on failure."""
-    out, err = _ff_capture([FFMPEG, "-nostdin", "-i", src, "-hide_banner"])
-    m = re.search(r"(\d{2,5})x(\d{2,5})", err or "")
-    if m:
-        return int(m.group(1)), int(m.group(2))
-    return 0, 0
+    """Return (width, height) of the source, or (0,0). Cached, with a SHORT timeout so
+    a slow/network source can never hang the mount (falls back to 0,0 = default aspect)."""
+    if src in _WH_CACHE:
+        return _WH_CACHE[src]
+    wh = (0, 0)
+    try:
+        p = subprocess.run([FFMPEG, "-nostdin", "-i", src, "-hide_banner"],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           timeout=8, creationflags=NO_WINDOW)
+        m = re.search(r"(\d{2,5})x(\d{2,5})", p.stderr.decode("utf-8", "replace"))
+        if m:
+            wh = (int(m.group(1)), int(m.group(2)))
+    except Exception:
+        wh = (0, 0)   # timeout or error -> proceed with default aspect (never hang)
+    _WH_CACHE[src] = wh
+    return wh
 
 
 def _is_full(axis, w, h):
@@ -242,19 +254,42 @@ def _is_full(axis, w, h):
         return ar < 1.2
 
 
-def _hwaccel_args(cfg, force_cpu_decode=False):
-    """Return -hwaccel args matching the encoder (cuda for nvenc, qsv for qsv), or []."""
+def _codec_hint(src):
+    """Guess the source video codec from the filename (cheap, no probe)."""
+    n = os.path.basename(src).lower()
+    if re.search(r"(hevc|h\.?265|x265)", n):
+        return "hevc"
+    if re.search(r"(av1)", n):
+        return "av1"
+    if re.search(r"(vp9)", n):
+        return "vp9"
+    if re.search(r"(h\.?264|x264|avc)", n):
+        return "h264"
+    return ""
+
+
+def _hwaccel_args(cfg, src=None, force_cpu_decode=False):
+    """Return -hwaccel args for GPU decoding, matching encoder + source codec, or [].
+    Explicitly selecting the hardware decoder (e.g. hevc_qsv) makes HW HEVC/AV1 decode
+    actually engage -- a bare -hwaccel often silently fails on HEVC and falls back to CPU."""
     if force_cpu_decode or not getattr(cfg, "hwdec", True):
         return []
+    codec = _codec_hint(src) if src else ""
     if cfg.encoder == "nvenc":
+        # -hwaccel cuda auto-downloads frames to system memory for the CPU filters.
+        # (Don't force -c:v <dec>: it can leave frames in GPU format and break the
+        #  crop/blend filters with a pixel-format error.)
         return ["-hwaccel", "cuda"]
     if cfg.encoder == "qsv":
+        # -hwaccel qsv auto-downloads frames for the CPU filters. Forcing the explicit
+        # decoder (hevc_qsv) leaves frames in 'qsv' pixel format and breaks the crop/
+        # blend with "Impossible to convert between the formats", so we don't.
         return ["-hwaccel", "qsv"]
     return []
 
 
-def _use_hwdec(cfg, force_cpu_decode=False):
-    return bool(_hwaccel_args(cfg, force_cpu_decode))
+def _use_hwdec(cfg, src=None, force_cpu_decode=False):
+    return bool(_hwaccel_args(cfg, src, force_cpu_decode))
 
 
 def build_ffmpeg_cmd(src, dst, cfg, layout, anaglyph=False, force_cpu_decode=False):
@@ -271,46 +306,25 @@ def build_ffmpeg_cmd(src, dst, cfg, layout, anaglyph=False, force_cpu_decode=Fal
     if anaglyph:
         # Green/magenta anaglyph: keep FULL 3D depth (both eyes), rendered as
         # green/magenta color so it plays on any normal screen with cheap glasses.
-        # stereo3d input layout: sbsl/sbs2l (half/full SBS), abl/ab2l (half/full OU).
-        # Detect half-vs-full from aspect at encode time via ffmpeg's own handling:
-        # we pick the "full" variant when the eye is already full-width/height.
-        # Simplest robust choice: use the half variants (sbsl/abl) after normalizing,
-        # which ffmpeg upscales correctly. Output squared pixels, 1920 wide.
-        w, h = _probe_wh(src)
-        full = _is_full(axis, w, h)
         L = float(getattr(cfg, "anaglyph_ghost", 0.3))   # crosstalk-cancel strength
-        # Anaglyph is heavy (two eyes + per-pixel blend). Use a configurable (often
-        # lower) height and cheap bilinear scaling so slower machines (Intel iGPU) can
-        # keep up in realtime. Through colored glasses the quality drop is invisible.
-        # Cap the output HEIGHT for performance (anaglyph_height), but PRESERVE the
-        # real aspect ratio -- do NOT force 16:9, or cinemascope (2.40:1) 3D movies
-        # get stretched tall. We un-squish the cropped eye (like the 2D path), then
-        # scale by height with width auto (-2) to keep the true shape.
+        # Determine full vs half from the FILENAME (instant -- avoids a network probe
+        # that stalls startup on remote/seedbox files). Default to half (most common).
+        _n = os.path.basename(src).lower()
+        full = bool(re.search(r"(?:^|[^a-z])(full|fsbs|f-?sbs|fou|f-?ou)(?:[^a-z]|$)", _n))
+        # Anaglyph is heavy (two eyes + per-pixel blend). Cap height for performance,
+        # preserve the true aspect (no 16:9 stretch), and un-squish with ffmpeg
+        # expressions so no absolute dimensions (and no probe) are needed.
         capH = int(getattr(cfg, "anaglyph_height", 0) or cfg.target_height or 1080)
-        # Work out the TRUE display aspect of one eye's final (un-squished) image, so
-        # the output isn't stretched, then scale each eye straight to that small size
-        # BEFORE the expensive per-pixel blend (~6x faster on weak CPUs).
-        #   SBS full:  one eye = (w/2) x h                 -> ar = (w/2)/h
-        #   SBS half:  one eye is squished; full image = w x h (2*eye_w) -> ar = w/h
-        #   OU  full:  one eye = w x (h/2)                 -> ar = w/(h/2)
-        #   OU  half:  one eye squished; full image = w x h -> ar = w/h
-        if w and h:
-            if axis == "ou":
-                disp_ar = (w / (h / 2)) if full else (w / h)
-            else:
-                disp_ar = ((w / 2) / h) if full else (w / h)
-        else:
-            disp_ar = 16 / 9
-        targW = max(2, int(round(capH * disp_ar / 2)) * 2)
         if axis == "ou":
             lcrop = "crop=iw:ih/2:0:0"
             rcrop = "crop=iw:ih/2:0:ih/2"
+            unsq = "" if full else "scale=iw:ih*2,"   # half-OU: un-squish height
         else:
             lcrop = "crop=iw/2:ih:0:0"
             rcrop = "crop=iw/2:ih:iw/2:0"
-        # scale each cropped eye straight to the small target -> blend runs cheap.
-        # gbrp = planar RGB so the blend math is in RGB (else heavy green cast).
-        sc = f"scale={targW}:{capH}:flags=bilinear,format=gbrp,setsar=1"
+            unsq = "" if full else "scale=iw*2:ih,"   # half-SBS: un-squish width
+        # cap height (width auto, preserves aspect), then gbrp for the RGB blend.
+        sc = f"{unsq}scale=-2:{capH}:flags=bilinear,format=gbrp,setsar=1"
         # Green/magenta with ghost reduction (TOP=left eye, BOTTOM=right eye):
         #   c0 Green = right.g - left.g*L
         #   c1 Blue  = left.b  - right.b*L
@@ -341,14 +355,14 @@ def build_ffmpeg_cmd(src, dst, cfg, layout, anaglyph=False, force_cpu_decode=Fal
         vmap = ["-map", "[vout]"]
         # audio maps from input 0 (video came from the complex graph)
         amap = ["-map", "0:a?"]
-        hw = _hwaccel_args(cfg, force_cpu_decode)
+        hw = _hwaccel_args(cfg, src, force_cpu_decode)
         base = ([cfg.ffmpeg, "-nostdin", "-loglevel", "error", "-y"] + hw + ["-i", src,
                  "-filter_complex", fc] + vmap + amap
                 + (["-c:a", "copy"] if cfg.copy_audio
                    else ["-c:a", "aac", "-b:a", "256k", "-ac", "2"])
                 + ["-sn"])
     else:
-        hw = _hwaccel_args(cfg, force_cpu_decode)
+        hw = _hwaccel_args(cfg, src, force_cpu_decode)
         base = ([cfg.ffmpeg, "-nostdin", "-loglevel", "error", "-y"] + hw + ["-i", src]
                 + maps + audio + ["-vf", vf])
     if cfg.encoder == "qsv":
@@ -514,7 +528,7 @@ class Entry:
                 except OSError:
                     pass
             else:                                  # ffmpeg errored
-                if _use_hwdec(self.cfg) and not self._force_cpu_decode:
+                if _use_hwdec(self.cfg, self.src) and not self._force_cpu_decode:
                     # GPU decode may not support this file's codec -> retry on CPU once.
                     self._force_cpu_decode = True
                     sys.stderr.write(f"[sbs2d] GPU decode failed on {os.path.basename(self.src)}, "
