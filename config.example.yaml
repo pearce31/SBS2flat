@@ -73,26 +73,29 @@ quality: 21
 # This cancels crosstalk (the ghosting where you see the other eye bleed through)
 # by subtracting each eye from the other. Range 0.0-0.6:
 #   0.0 = no cancellation (brightest, most ghosting)
-#   0.30 = default (good balance)
-#   0.50 = strong cancellation (least ghosting, slightly darker)
+#   0.15 = default (good balance)
+#   0.30 = strong cancellation (least ghosting, slightly darker)
 anaglyph_ghost: 0.30
 
-# Anaglyph output height. Anaglyph is CPU-heavy; on slower machines (e.g. Intel
-# iGPU) it can stutter at 1080p. Lowering it makes anaglyph encode much faster and
-# it looks the same through colored glasses.
-#   0   = same as target_height (best for strong GPUs like NVIDIA)
-#   720 = recommended for Intel / weaker machines
-#   540 = for very weak machines
-# Only affects anaglyph mode; 2D and 3D stay at full resolution.
+# Anaglyph output height. Anaglyph is the heaviest mode (two eyes + a per-pixel
+# blend). On weaker machines it stutters at full resolution. Lowering it makes
+# anaglyph encode much faster and looks the same through colored glasses.
+#   0   = same as target_height (fine for strong GPUs like NVIDIA)
+#   540 = good for mid-range
+#   360 = recommended for Intel iGPU / weak machines (smooth with margin)
+# Tip: aim for a value where a test transcode runs comfortably above 1.0x speed, so
+# playback never dips below realtime. Only affects anaglyph; 2D and 3D stay full res.
 anaglyph_height: 0
 
 # Max number of titles converting at once. Raise on a strong PC; lower if it struggles.
 max_transcodes: 2
 
-# GPU decoding (NVIDIA only). When encoder is nvenc, also decode the source on the
-# GPU so your CPU isn't doing the heavy 4K/HEVC/AV1 decoding. Big CPU savings.
-# Files whose codec the GPU can't decode automatically fall back to CPU decode.
-# Set false to always decode on CPU.
+# GPU decoding. When encoder is nvenc (NVIDIA) or qsv (Intel), also decode the source
+# on the GPU so the CPU isn't doing heavy 4K/HEVC/AV1 decoding.
+#   NVIDIA: usually leave true.
+#   Intel QSV: HEVC decode can be flaky and fall back to CPU repeatedly, which causes
+#     playback stalls. If you see periodic pausing on an Intel machine, set this to
+#     false -- CPU decode is often fast enough and avoids the retry stalls.
 gpu_decode: true
 
 # ------------------------------------------------------------
