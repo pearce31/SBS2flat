@@ -29,24 +29,25 @@ output: "C:\\SBS2Flat"
 libraries:
   # --- Movies ---
   - label: "Movies"
-    path: "Y:\\Blockbuster Movies"
+    path: "D:\\3D Movies"
     mode: 2d
 
-  # --- TV Shows ---  (works the same as movies)
+  # --- Examples (uncomment to use) ---
   # - label: "TV Shows"
   #   path: "D:\\3D TV Shows"
   #   mode: 2d
 
-  # --- Examples (uncomment to use) ---
-  # Same movies, also offered as anaglyph:
-  - label: "Movies (Anaglyph)"
-    path: "Y:\\Blockbuster Movies"
-    mode: anaglyph
+  # - label: "Movies (Anaglyph)"
+  #   path: "D:\\3D Movies"
+  #   mode: anaglyph
 
-  # Same shows, also offered as raw 3D for a 3D TV:
   # - label: "TV Shows 3D"
   #   path: "D:\\3D TV Shows"
   #   mode: 3d
+
+  # - label: "2D To 3D Movies"
+  #   path: "D:\\Movies"
+  #   mode: depth3d
 
 # ------------------------------------------------------------
 #  Encoding  (usually leave these alone)
@@ -73,9 +74,21 @@ quality: 21
 # This cancels crosstalk (the ghosting where you see the other eye bleed through)
 # by subtracting each eye from the other. Range 0.0-0.6:
 #   0.0 = no cancellation (brightest, most ghosting)
-#   0.15 = default (good balance)
-#   0.30 = strong cancellation (least ghosting, slightly darker)
-anaglyph_ghost: 0.30
+#   0.3 = default (good balance)
+#   0.5 = strong cancellation (least ghosting, slightly darker)
+anaglyph_ghost: 0.3
+
+# ------------------------------------------------------------
+#  2D-to-3D depth shader (only affects "depth3d" mode)
+# ------------------------------------------------------------
+# Turns flat 2D into green/magenta 3D by faking depth from the image. Needs a GPU
+# and: pip install moderngl numpy
+# depth_strength: how much fake depth (0.2-0.5 typical; 0.30 is a good default)
+# depth_ghost:    crosstalk cancellation, cuts green ghosting (0.0-0.6; 0.3 default)
+# depth_width:    processing width; lower = faster (1280 is a good balance)
+depth_strength: 0.30
+depth_ghost: 0.3
+depth_width: 1280
 
 # Anaglyph output height. Anaglyph is the heaviest mode (two eyes + a per-pixel
 # blend). On weaker machines it stutters at full resolution. Lowering it makes

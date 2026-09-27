@@ -1,2 +1,5 @@
 pyyaml>=6.0
 winfspy>=0.8.0
+# optional -- only needed for depth3d (2D->3D) mode:
+moderngl>=5.8
+numpy>=1.23

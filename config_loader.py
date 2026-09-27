@@ -61,7 +61,7 @@ def load_config(path="config.yaml"):
     if not libs:
         raise ConfigError("config.yaml: add at least one entry under 'libraries'.")
 
-    maps, passthrough, anaglyph = [], [], []
+    maps, passthrough, anaglyph, depth3d = [], [], [], []
     for i, lib in enumerate(libs, 1):
         label = lib.get("label")
         src = lib.get("path")
@@ -77,12 +77,15 @@ def load_config(path="config.yaml"):
             passthrough.append(spec)
         elif mode == "anaglyph":
             anaglyph.append(spec)
+        elif mode in ("depth3d", "depth", "2dto3d"):
+            depth3d.append(spec)
         else:
             raise ConfigError(f"libraries[{i}]: unknown mode '{mode}' (use 2d, 3d, or anaglyph).")
 
     out["map"] = maps
     out["passthrough"] = passthrough
     out["anaglyph"] = anaglyph
+    out["depth3d"] = depth3d
     out["ffmpeg"] = _find_ffmpeg(raw.get("ffmpeg"))
     out["encoder"] = _pick_encoder(raw.get("encoder"))
     out["target_height"] = int(raw.get("target_height", 1080))
@@ -94,6 +97,9 @@ def load_config(path="config.yaml"):
     out["wait_for_sources"] = int(raw.get("wait_for_sources", 120))
     out["anaglyph_ghost"] = float(raw.get("anaglyph_ghost", 0.3))
     out["gpu_decode"] = bool(raw.get("gpu_decode", True))
+    out["depth_strength"] = float(raw.get("depth_strength", 0.30))
+    out["depth_ghost"] = float(raw.get("depth_ghost", 0.3))
+    out["depth_width"] = int(raw.get("depth_width", 1280))
     out["anaglyph_height"] = int(raw.get("anaglyph_height", 0) or 0)
     return out
 

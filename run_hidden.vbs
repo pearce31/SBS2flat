@@ -4,7 +4,7 @@
 ' Edit the two paths below if your setup differs.
 
 Dim shell, pyExe, script, folder
-folder = "C:\SBS2Flat\app"          ' <-- folder containing sbs2flat.py
+folder = "C:\Users\pearc\Downloads\sbs2flat\sbs2flat"          ' <-- folder containing sbs2flat.py
 pyExe  = "pythonw.exe"               ' pythonw = Python with no console window
 
 Set shell = CreateObject("WScript.Shell")

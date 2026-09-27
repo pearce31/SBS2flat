@@ -403,9 +403,12 @@ def probe(src):
 # Ephemeral transcode entry
 # --------------------------------------------------------------------------- #
 class Entry:
-    def __init__(self, src, cache_base, cfg, sema, anaglyph=False):
+    def __init__(self, src, cache_base, cfg, sema, anaglyph=False, evict_cb=None, depth3d=False):
         self.src, self.cfg, self.sema = src, cfg, sema
         self.anaglyph = anaglyph
+        self._read_count = 0
+        self._evict_cb = evict_cb
+        self.depth3d = depth3d
         self._force_cpu_decode = False   # set True after a GPU-decode failure
         st = os.stat(src)
         mode = "ag" if anaglyph else "2d"
@@ -446,16 +449,32 @@ class Entry:
             if self.refs == 0:
                 self.zero_since = time.time()
 
+    def _terminate_proc(self):
+        """Kill the transcode process AND its children (depth3d spawns child ffmpeg;
+        a plain terminate() would orphan them and pile up)."""
+        p = self.proc
+        if p is None:
+            return
+        try:
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(p.pid)],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            else:
+                p.terminate()
+        except Exception:
+            try:
+                p.terminate()
+            except Exception:
+                pass
+
     def kill_if_read_idle(self, timeout):
         # A transcode nobody is reading from (e.g. Plex just analyzing headers)
         # is aborted quickly so a library scan can't spawn full-movie encodes.
         with self.lock:
             if self.proc and not self.finished and time.time() - self.last_read > timeout:
                 self._killed = True
-                try:
-                    self.proc.terminate()   # _watch() releases the slot + clears proc
-                except Exception:
-                    pass
+                self._terminate_proc()   # kill tree (depth3d child ffmpeg too)
 
     def _resolve_layout(self):
         if self._layout:
@@ -479,17 +498,37 @@ class Entry:
         with self.lock:
             if self.finished or self.failed or self.proc is not None:
                 return
-            if not self.sema.acquire(timeout=self.cfg.slot_timeout):
-                return
+            got = self.sema.acquire(blocking=False)
+            if not got:
+                # No free slot. If THIS is playback (continuous reads), evict a
+                # scan-probe transcode so playback never waits on a scan.
+                if self._read_count >= 4 and self._evict_cb is not None:
+                    self._evict_cb(self)
+                got = self.sema.acquire(timeout=self.cfg.slot_timeout)
+                if not got:
+                    return
             self._slot = True
             for p in (self.part, self.final):
                 try:
                     os.remove(p)
                 except OSError:
                     pass
-            layout = self._resolve_layout()
-            cmd = build_ffmpeg_cmd(self.src, self.part, self.cfg, layout, anaglyph=self.anaglyph, force_cpu_decode=self._force_cpu_decode)
-            line = f"START [{layout[0]} half={layout[1]}] " + " ".join(cmd)
+            if self.depth3d:
+                # 2D->3D depth shader (GPU) instead of the ffmpeg crop pipeline.
+                cmd = [sys.executable, self.cfg.depth_script,
+                       "--src", self.src, "--dst", self.part,
+                       "--ffmpeg", self.cfg.ffmpeg,
+                       "--width", str(getattr(self.cfg, "depth_width", 1280)),
+                       "--strength", str(getattr(self.cfg, "depth_strength", 0.30)),
+                       "--ghost", str(getattr(self.cfg, "depth_ghost", 0.3)),
+                       "--encoder", self.cfg.encoder,
+                       "--maxrate", str(self.cfg.maxrate),
+                       "--quality", str(self.cfg.quality)]
+                line = "START [depth3d] " + " ".join(cmd)
+            else:
+                layout = self._resolve_layout()
+                cmd = build_ffmpeg_cmd(self.src, self.part, self.cfg, layout, anaglyph=self.anaglyph, force_cpu_decode=self._force_cpu_decode)
+                line = f"START [{layout[0]} half={layout[1]}] " + " ".join(cmd)
             if self.cfg.verbose:
                 sys.stderr.write(line + "\n")
             try:
@@ -578,6 +617,7 @@ class Entry:
         if offset >= self.estimate:
             return b""
         self.last_read = time.time()
+        self._read_count += 1
         self.ensure_running()
         if self.failed:
             return b""
@@ -643,12 +683,13 @@ class Node:
             _lbl = _wp.split("\\", 1)[0] if _wp else ""
             _pass = _lbl in getattr(cfg, "passthrough_labels", set())
             _ana = _lbl in getattr(cfg, "anaglyph_labels", set())
+            _dep = _lbl in getattr(cfg, "depth3d_labels", set())
         except Exception:
-            _pass = _ana = False
+            _pass = _ana = _dep = False
         is_video = (not self.is_dir and os.path.splitext(src)[1].lower() in VIDEO_EXT)
-        # passthrough -> serve raw (never transcode). anaglyph -> always transcode.
+        # passthrough -> serve raw (never transcode). anaglyph/depth3d -> always transcode.
         # otherwise -> transcode only if detected as 3D.
-        self.is_sbs = is_video and not _pass and (_ana or detected)
+        self.is_sbs = is_video and not _pass and (_ana or _dep or detected)
         if self.is_dir:
             self.attributes = FILE_ATTRIBUTE.FILE_ATTRIBUTE_DIRECTORY
             self.size = 0
@@ -693,6 +734,18 @@ class SBS2DOperations(BaseFileSystemOperations):
         self._dircache = {}
         self._nodecache = {}
         self._namemap = {}   # (parent_win_path -> {clean_name: real_basename})
+        # Last-known-good directory listings, persisted so a temporary source outage
+        # (NAS/cloud blip) doesn't make folders look empty -> which makes media servers
+        # PURGE the library. Survives restarts.
+        self._lkg = {}
+        self._lkg_file = os.path.join(self.cfg.cache, "lkg_listings.json")
+        try:
+            import json as _json
+            with open(self._lkg_file, "r", encoding="utf-8") as _f:
+                self._lkg = _json.load(_f)
+        except Exception:
+            self._lkg = {}
+        self._lkg_lock = threading.Lock()
         self.emap_lock = threading.Lock()
         self.sema = threading.BoundedSemaphore(cfg.max_transcodes)
         threading.Thread(target=self._reaper, daemon=True).start()
@@ -700,15 +753,34 @@ class SBS2DOperations(BaseFileSystemOperations):
     def _parts(self, file_name):
         return [x for x in PureWindowsPath(file_name).parts if x not in ("\\", "/")]
 
+    def _evict_for_playback(self, requester):
+        """Free a transcode slot for playback by stopping the most scan-probe-like
+        running transcode (lowest read count, not the requester)."""
+        with self.emap_lock:
+            candidates = [e for e in self.entries.values()
+                          if e is not requester and e._slot and e.proc is not None]
+        if not candidates:
+            return
+        victim = min(candidates, key=lambda e: e._read_count)
+        if victim._read_count <= 3:
+            try:
+                victim._killed = True
+                if victim.proc is not None:
+                    victim._terminate_proc()
+            except Exception:
+                pass
+
     def _entry(self, win_path, src):
         # Anaglyph if the top-level label is an anaglyph label.
         parts = self._parts(win_path)
         lbl = parts[0] if parts else ""
         ana = lbl in getattr(self.cfg, "anaglyph_labels", set())
+        dep = lbl in getattr(self.cfg, "depth3d_labels", set())
         with self.emap_lock:
             e = self.entries.get(win_path)
             if e is None:
-                e = Entry(src, self.cfg.cache, self.cfg, self.sema, anaglyph=ana)
+                e = Entry(src, self.cfg.cache, self.cfg, self.sema, anaglyph=ana,
+                          evict_cb=self._evict_for_playback, depth3d=dep)
                 self.entries[win_path] = e
             return e
 
@@ -869,6 +941,36 @@ class SBS2DOperations(BaseFileSystemOperations):
             break
         return path
 
+    def _lkg_save(self, key, listing):
+        # Only persist when this folder's listing CHANGED, debounced, written outside
+        # the lock -- so a normal browse never rewrites a big JSON synchronously.
+        try:
+            new_val = [[d, r] for (d, r) in listing]
+            with self._lkg_lock:
+                if self._lkg.get(key) == new_val:
+                    return
+                self._lkg[key] = new_val
+                now = time.time()
+                last = getattr(self, "_lkg_last_write", 0)
+                if now - last < 10:
+                    return
+                self._lkg_last_write = now
+                snapshot = dict(self._lkg)
+            import json as _json
+            tmp = self._lkg_file + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                _json.dump(snapshot, f)
+            os.replace(tmp, self._lkg_file)
+        except Exception:
+            pass
+
+    def _lkg_get(self, key):
+        with self._lkg_lock:
+            v = self._lkg.get(key)
+        if not v:
+            return None
+        return [(d, r) for (d, r) in v]
+
     def _dir_children(self, node):
         # returns list of (name, real_src_or_None); None means a label under root
         _ck = "dc:" + str(node.win_path)
@@ -902,38 +1004,56 @@ class SBS2DOperations(BaseFileSystemOperations):
             return disp
         if node.union_dirs:                              # merged label -> union drives
             seen, out = set(), []
+            any_offline = False
             for base0 in node.union_dirs:
                 base = self._collapse_dir(base0) if os.path.isdir(base0) else base0
-                if not os.path.isdir(base):              # source (seedbox) offline -> skip it
+                if not os.path.isdir(base):              # source offline
+                    any_offline = True
                     continue
                 try:
                     names = sorted(os.listdir(base))
                 except OSError:
+                    any_offline = True
                     continue
                 for n in names:
                     if n in seen:
                         continue
-                    if _is_hidden(n):                    # skip .iso etc.
+                    if _is_hidden(n):
                         continue
                     seen.add(n)
                     disp = _present(n, os.path.join(base, n))
                     out.append((disp, os.path.join(base, n)))
+            if not out and any_offline:
+                lkg = self._lkg_get(_ck)                 # sources down -> show last-known
+                if lkg:
+                    return lkg
+            elif out:
+                self._lkg_save(_ck, out)
             self._namemap[str(node.win_path)] = cmap
             self._dircache_put(_ck, out)
             return out
+        src_ok = bool(node.src and os.path.isdir(node.src))
+        if not src_ok:
+            lkg = self._lkg_get(_ck)                     # source offline -> last-known
+            if lkg:
+                return lkg
+            return []
         try:
-            _src = self._collapse_dir(node.src) if (node.src and os.path.isdir(node.src)) else node.src
+            _src = self._collapse_dir(node.src)
             out = []
             for n in sorted(os.listdir(_src)):
                 if _is_hidden(n):
                     continue
                 disp = _present(n, os.path.join(_src, n))
                 out.append((disp, os.path.join(_src, n)))
+            if out:
+                self._lkg_save(_ck, out)
             self._namemap[str(node.win_path)] = cmap
             self._dircache_put(_ck, out)
             return out
         except OSError:
-            return []
+            lkg = self._lkg_get(_ck)
+            return lkg if lkg else []
 
     def read_directory(self, file_context, marker):
         node = file_context.node
@@ -1036,11 +1156,18 @@ def run(c):
     cfg.anaglyph_ghost = float(c.get("anaglyph_ghost", 0.3))
     cfg.hwdec = bool(c.get("gpu_decode", True))
     cfg.anaglyph_height = int(c.get("anaglyph_height", 0) or 0)
+    # depth3d (2D->3D depth shader) options
+    cfg.depth3d       = list(c.get("depth3d", []))
+    cfg.depth_strength= float(c.get("depth_strength", 0.30))
+    cfg.depth_ghost   = float(c.get("depth_ghost", 0.3))
+    cfg.depth_width   = int(c.get("depth_width", 1280))
+    cfg.depth_script  = c.get("depth_script", "") or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "sbs2flat_shader3d.py")
     CLEAN_NAMES = bool(c.get("clean_names", True))
     HIDE_JUNK   = bool(c.get("hide_junk", True))
     COLLAPSE    = bool(c.get("collapse_folders", True))
 
-    if not cfg.map and not cfg.passthrough and not cfg.anaglyph:
+    if not cfg.map and not cfg.passthrough and not cfg.anaglyph and not cfg.depth3d:
         raise SystemExit("No source folders configured. Add some under 'libraries' in config.yaml.")
 
     # Ensure the mount point can be created. For a folder path like C:\SBS2Flat,
@@ -1063,6 +1190,7 @@ def run(c):
     cfg.mounts = {}
     cfg.passthrough_labels = set()
     cfg.anaglyph_labels = set()
+    cfg.depth3d_labels = set()
 
     def _register(specs, kind):
         for m in specs:
@@ -1074,6 +1202,8 @@ def run(c):
                 cfg.passthrough_labels.add(label)
             elif kind == "ana":
                 cfg.anaglyph_labels.add(label)
+            elif kind == "depth":
+                cfg.depth3d_labels.add(label)
             if not os.path.isdir(path):
                 sys.stderr.write(f"WARNING: source not available, skipping for now: {path}\n")
             cfg.mounts.setdefault(label, []).append(os.path.abspath(path))
@@ -1081,6 +1211,7 @@ def run(c):
     _register(cfg.map, "map")
     _register(cfg.passthrough, "pass")
     _register(cfg.anaglyph, "ana")
+    _register(cfg.depth3d, "depth")
     cfg.sbs_re = None
     FFMPEG = cfg.ffmpeg
 
@@ -1118,7 +1249,8 @@ def run(c):
     )
     print("[SBS2Flat] Sources:")
     for lbl, paths in cfg.mounts.items():
-        mode = ("anaglyph" if lbl in cfg.anaglyph_labels else
+        mode = ("depth3D" if lbl in cfg.depth3d_labels else
+                "anaglyph" if lbl in cfg.anaglyph_labels else
                 "raw-3D" if lbl in cfg.passthrough_labels else "2D")
         for path in paths:
             print(f"   {cfg.mountpoint}\\{lbl}  [{mode}]  <-  {path}")
