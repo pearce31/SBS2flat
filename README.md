@@ -13,13 +13,12 @@ at that folder — or just open it and play a file directly — and everything l
 normal. It can also serve the same movies as **anaglyph** (for cheap green/magenta
 glasses) or pass them through as raw 3D.
 
-> This solves a request people have been making for over a decade. As far as I know,
-> nothing else does live SBS/OU→2D as a drop-in layer for a media server.
 
 ## What it does
 
 * **2D mode** — crops one eye and un-squishes it to a normal flat picture.
-* **Anaglyph mode** — merges both eyes into green/magenta 3D, watchable on any screen with cheap glasses (keeps full depth).
+* **2D To 3D Anaglyph mode** - uses my custom green/magenta on any 2D content.I use trioviz inficolor glasses off amazon and it's probably the best there is as far as Anaglyph goes.
+* **Anaglyph mode** — merges both eyes into green/magenta 3D, watchable on any screen with cheap glasses (keeps full depth).I use trioviz inficolor glasses off amazon and it's probably the best there is as far as Anaglyph goes.
 * **3D passthrough** — serves the original file unchanged, for real 3D displays.
 * **Auto-detects** side-by-side vs over-under, and half vs full, per file.
 * **Cleans up names** (strips `\_HSBS`, `3D`, release junk) so cover art matches.
@@ -93,7 +92,7 @@ the exact path).
 
 ## Notes on performance
 
-Conversion happens live, so the first few seconds of a movie take a moment while it
+Conversion happens live, so the first few minutes of a movie take a moment while it
 starts encoding. Hardware encoding keeps this smooth. Seeking far ahead of what's
 been converted will pause while it catches up. This is normal for on-the-fly
 conversion — the trade for not pre-converting your whole library.
